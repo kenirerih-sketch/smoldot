@@ -90,6 +90,9 @@ pub(super) struct Config<TPlat: PlatformRef> {
     /// Hash of the genesis block of the chain.
     pub genesis_block_hash: [u8; 32],
 
+    /// Statement protocol configuration. `None` if the statement protocol is disabled.
+    pub statement_protocol_config: Option<network_service::StatementProtocolConfig>,
+
     /// Maximum number of seen statement hashes tracked per subscription for dedup.
     /// `None` if the statement protocol is disabled.
     pub max_seen_statements: Option<NonZero<usize>>,
@@ -122,6 +125,8 @@ struct Background<TPlat: PlatformRef> {
 
     /// Randomness used for various purposes, such as generating subscription IDs.
     randomness: ChaCha20Rng,
+
+    statement_protocol_config: Option<network_service::StatementProtocolConfig>,
 
     /// See [`Config::network_service`].
     network_service: Arc<network_service::NetworkServiceChain<TPlat>>,
@@ -236,8 +241,38 @@ struct Background<TPlat: PlatformRef> {
     /// Active statement subscriptions. Maps subscription ID to subscription state.
     statement_subscriptions: hashbrown::HashMap<String, StatementSubscription, fnv::FnvBuildHasher>,
 
+    statement_affinity_stale: bool,
+    next_statement_affinity_update: Option<Pin<Box<TPlat::Delay>>>,
+    last_statement_affinity_update: Option<TPlat::Instant>,
+
     /// Receiver for network events (statements from peers).
     network_events_rx: Option<async_channel::Receiver<network_service::Event>>,
+}
+
+impl<TPlat: PlatformRef> Background<TPlat> {
+    /// Marks the statement affinity as stale and schedules the next update.
+    /// If no update was ever sent, or the last update was more than the configured
+    /// affinity update interval ago, the update fires immediately.
+    /// Otherwise, it fires after the remaining interval.
+    fn schedule_statement_affinity_update(&mut self) {
+        if self.statement_affinity_stale {
+            return;
+        }
+        self.statement_affinity_stale = true;
+        let interval = self
+            .statement_protocol_config
+            .as_ref()
+            .expect("affinity updates require statement protocol; qed")
+            .affinity_update_interval();
+        let delay = match &self.last_statement_affinity_update {
+            Some(last) => {
+                let elapsed = self.platform.now() - last.clone();
+                interval.saturating_sub(elapsed)
+            }
+            None => Duration::ZERO,
+        };
+        self.next_statement_affinity_update = Some(Box::pin(self.platform.sleep(delay)));
+    }
 }
 
 /// State of the subscription towards the runtime service.
@@ -552,6 +587,7 @@ pub(super) async fn run<TPlat: PlatformRef>(
             config.platform.fill_random_bytes(&mut seed);
             seed
         }),
+        statement_protocol_config: config.statement_protocol_config,
         next_garbage_collection: Box::pin(config.platform.sleep(Duration::new(0, 0))),
         network_service: config.network_service.clone(),
         sync_service: config.sync_service.clone(),
@@ -618,6 +654,9 @@ pub(super) async fn run<TPlat: PlatformRef>(
             16,
             Default::default(),
         ),
+        statement_affinity_stale: false,
+        next_statement_affinity_update: None,
+        last_statement_affinity_update: None,
         network_events_rx: None,
         platform: config.platform,
     };
@@ -654,6 +693,7 @@ pub(super) async fn run<TPlat: PlatformRef>(
             NotifyNewHeadsRuntimeSubscriptions(Option<[u8; 32]>),
             NetworkStatementsReceived(Vec<([u8; 32], codec::Statement)>),
             MustSubscribeNetworkEvents,
+            StatementAffinityUpdate,
         }
 
         // Wait until there is something to do.
@@ -746,6 +786,15 @@ pub(super) async fn run<TPlat: PlatformRef>(
                 WakeUpReason::GarbageCollection
             })
             .or(async {
+                if let Some(delay) = &mut me.next_statement_affinity_update {
+                    delay.await;
+                } else {
+                    future::pending().await
+                }
+                me.next_statement_affinity_update = None;
+                WakeUpReason::StatementAffinityUpdate
+            })
+            .or(async {
                 let Some(rx) = &me.network_events_rx else {
                     return WakeUpReason::MustSubscribeNetworkEvents;
                 };
@@ -754,9 +803,11 @@ pub(super) async fn run<TPlat: PlatformRef>(
                         me.network_events_rx = None;
                         return WakeUpReason::MustSubscribeNetworkEvents;
                     };
-                    if let network_service::Event::StatementsNotification { statements, .. } = event
-                    {
-                        return WakeUpReason::NetworkStatementsReceived(statements);
+                    match event {
+                        network_service::Event::StatementsNotification { statements, .. } => {
+                            return WakeUpReason::NetworkStatementsReceived(statements);
+                        }
+                        _ => {}
                     }
                 }
             })
@@ -783,6 +834,21 @@ pub(super) async fn run<TPlat: PlatformRef>(
                 me.multistage_requests_to_advance.shrink_to_fit();
                 me.block_headers_pending.shrink_to_fit();
                 me.block_runtimes_pending.shrink_to_fit();
+            }
+
+            WakeUpReason::StatementAffinityUpdate => {
+                me.statement_affinity_stale = false;
+                me.last_statement_affinity_update = Some(me.platform.now());
+
+                let combined_filter = build_combined_affinity_filter(
+                    &me.statement_subscriptions,
+                    me.statement_protocol_config
+                        .as_ref()
+                        .expect("statement affinity requires statement protocol; qed"),
+                );
+                me.network_service
+                    .update_topic_affinity(combined_filter)
+                    .await;
             }
 
             WakeUpReason::MustSubscribeNetworkEvents => {
@@ -2944,6 +3010,8 @@ pub(super) async fn run<TPlat: PlatformRef>(
                             StatementSubscription::new(filter, me.max_seen_statements),
                         );
 
+                        me.schedule_statement_affinity_update();
+
                         let _ = me
                             .responses_tx
                             .send(
@@ -2957,6 +3025,11 @@ pub(super) async fn run<TPlat: PlatformRef>(
 
                     methods::MethodCall::statement_unsubscribeStatement { subscription } => {
                         let existed = me.statement_subscriptions.remove(&subscription).is_some();
+
+                        if existed {
+                            me.schedule_statement_affinity_update();
+                        }
+
                         let _ = me
                             .responses_tx
                             .send(
@@ -6100,4 +6173,30 @@ fn convert_runtime_version(
             .map(|api| (methods::HexString(api.name_hash.to_vec()), api.version))
             .collect(),
     }
+}
+
+fn build_combined_affinity_filter(
+    subscriptions: &hashbrown::HashMap<String, StatementSubscription, fnv::FnvBuildHasher>,
+    config: &network_service::StatementProtocolConfig,
+) -> network_service::AffinityFilter {
+    use smoldot::json_rpc::methods::TopicFilter;
+
+    let mut all_topics: Vec<&[u8; 32]> = Vec::new();
+
+    for sub in subscriptions.values() {
+        match &sub.topic_filter {
+            TopicFilter::Any => {
+                return network_service::AffinityFilter::match_all(config.bloom_seed());
+            }
+            TopicFilter::MatchAll(topics) | TopicFilter::MatchAny(topics) => {
+                all_topics.extend(topics.iter());
+            }
+        }
+    }
+
+    network_service::AffinityFilter::from_topics(
+        all_topics.into_iter(),
+        config.bloom_seed(),
+        config.false_positive_rate(),
+    )
 }

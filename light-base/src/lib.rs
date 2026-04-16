@@ -675,8 +675,9 @@ impl<TPlat: platform::PlatformRef, TChain> Client<TPlat, TChain> {
             }
         };
 
-        let max_seen_statements = config
-            .statement_protocol_config
+        let statement_protocol_config = config.statement_protocol_config;
+
+        let max_seen_statements = statement_protocol_config
             .as_ref()
             .map(|c| c.max_seen_statements());
 
@@ -704,8 +705,6 @@ impl<TPlat: platform::PlatformRef, TChain> Client<TPlat, TChain> {
                         self.platform.client_version()
                     );
 
-                    let statement_protocol_config = config.statement_protocol_config;
-
                     let config = match (&relay_chain, &chain_information) {
                         (Some((relay_chain, para_id, _)), _) => StartServicesChainTy::Parachain {
                             relay_chain,
@@ -730,7 +729,7 @@ impl<TPlat: platform::PlatformRef, TChain> Client<TPlat, TChain> {
                         chain_spec.fork_id().map(|f| f.to_owned()),
                         config,
                         network_identify_agent_version,
-                        statement_protocol_config,
+                        statement_protocol_config.clone(),
                     )
                 };
 
@@ -945,6 +944,7 @@ impl<TPlat: platform::PlatformRef, TChain> Client<TPlat, TChain> {
                 system_name: self.platform.client_name().into_owned(),
                 system_version: self.platform.client_version().into_owned(),
                 genesis_block_hash,
+                statement_protocol_config,
                 max_seen_statements,
             });
 
